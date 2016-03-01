@@ -24,25 +24,96 @@ const (
 type Exporter struct {
 	mu         sync.Mutex
 	collectors []prometheus.Collector
+
+	errC chan error
+
+	haltMu sync.RWMutex
+	halt   bool
+
+	done func()
 }
 
 // Verify that the Exporter implements the prometheus.Collector interface.
 var _ prometheus.Collector = &Exporter{}
 
-// New creates a new Exporter which collects metrics from one or mote sites.
+// New creates a new Exporter which collects metrics from one or more sites.
+//
+// Once the Exporter is created, call its ErrC method to retrieve a channel
+// of incoming errors encountered during metrics collection.  This channel
+// must be drained for metrics collection to proceed.
+//
+// When the Exporter is no longer needed, call its Close method to clean
+// up its resources.
 func New(c *unifi.Client, sites []*unifi.Site) *Exporter {
-	return &Exporter{
+	dc := NewDeviceCollector(c, sites)
+	sc := NewStationCollector(c, sites)
+
+	errC := make(chan error)
+
+	e := &Exporter{
+		errC: errC,
+
 		collectors: []prometheus.Collector{
-			NewDeviceCollector(c, sites),
-			NewStationCollector(c, sites),
+			dc,
+			sc,
 		},
 	}
+
+	var wg sync.WaitGroup
+	doneC := make(chan struct{})
+
+	// Fan in errors from external error channels to Exporter's error channel
+	wg.Add(1)
+	go e.fanInErrors(
+		&wg,
+		doneC,
+		dc.ErrC(),
+		sc.ErrC(),
+	)
+
+	// Clean up collectors and error fan-in goroutine when Close is called later
+	e.done = func() {
+		dc.Close()
+		sc.Close()
+
+		close(doneC)
+		wg.Wait()
+
+		close(errC)
+	}
+
+	return e
+}
+
+// ErrC returns a channel of incoming errors encountered during metrics
+// collection.  This channel must be drained for metrics collection
+// to proceed.
+func (e *Exporter) ErrC() <-chan error {
+	return e.errC
+}
+
+// Close halts all metric collection activity and cleans up the
+// Exporter's resources when it is no longer needed.
+func (e *Exporter) Close() {
+	e.haltMu.Lock()
+	defer e.haltMu.Unlock()
+
+	e.halt = true
+
+	e.done()
 }
 
 // Describe sends all the descriptors of the collectors included to
 // the provided channel.
-func (c *Exporter) Describe(ch chan<- *prometheus.Desc) {
-	for _, cc := range c.collectors {
+func (e *Exporter) Describe(ch chan<- *prometheus.Desc) {
+	e.haltMu.Lock()
+	defer e.haltMu.Unlock()
+
+	if e.halt {
+		return
+	}
+
+	for _, cc := range e.collectors {
 		cc.Describe(ch)
 	}
 }
@@ -50,12 +121,49 @@ func (c *Exporter) Describe(ch chan<- *prometheus.Desc) {
 // Collect sends the collected metrics from each of the collectors to
 // prometheus. Collect could be called several times concurrently
 // and thus its run is protected by a single mutex.
-func (c *Exporter) Collect(ch chan<- prometheus.Metric) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
+	e.haltMu.Lock()
+	defer e.haltMu.Unlock()
 
-	for _, cc := range c.collectors {
+	if e.halt {
+		return
+	}
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	for _, cc := range e.collectors {
 		cc.Collect(ch)
+	}
+}
+
+// fanInErrors collectors errors from incoming channels and fans them into
+// the Exporter's error channel.
+// Reference: https://blog.golang.org/pipelines.
+func (e *Exporter) fanInErrors(
+	wg *sync.WaitGroup,
+	doneC chan struct{},
+	errCs ...<-chan error,
+) {
+	var fanWG sync.WaitGroup
+
+	out := func(errC <-chan error) {
+		for err := range errC {
+			e.errC <- err
+		}
+		fanWG.Done()
+	}
+
+	fanWG.Add(len(errCs))
+	for _, errC := range errCs {
+		go out(errC)
+	}
+
+	select {
+	case <-doneC:
+		fanWG.Wait()
+		wg.Done()
+		return
 	}
 }
 

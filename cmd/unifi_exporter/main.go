@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"os/signal"
 	"strings"
 	"time"
 
@@ -71,18 +73,35 @@ func main() {
 		log.Fatalf("failed to select a site: %v", err)
 	}
 
-	prometheus.MustRegister(unifiexporter.New(c, useSites))
+	e := unifiexporter.New(c, useSites)
+
+	go func() {
+		for err := range e.ErrC() {
+			log.Println("error collecting metrics:", err)
+		}
+	}()
+
+	prometheus.MustRegister(e)
 
 	http.Handle(*metricsPath, prometheus.Handler())
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, *metricsPath, http.StatusMovedPermanently)
 	})
 
-	log.Printf("Starting UniFi exporter on %q for site(s): %s", *telemetryAddr, sitesString(useSites))
+	go func() {
+		log.Printf("starting UniFi exporter on %q for site(s): %s", *telemetryAddr, sitesString(useSites))
+		if err := http.ListenAndServe(*telemetryAddr, nil); err != nil {
+			log.Fatalf("cannot start UniFi exporter: %s", err)
+		}
+	}()
 
-	if err := http.ListenAndServe(*telemetryAddr, nil); err != nil {
-		log.Fatalf("cannot start UniFi exporter: %s", err)
-	}
+	sigC := make(chan os.Signal)
+	signal.Notify(sigC, os.Interrupt, os.Kill)
+
+	<-sigC
+	log.Println("stopping UniFi exporter")
+
+	e.Close()
 }
 
 // pickSites attempts to find a site with a description matching the value

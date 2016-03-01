@@ -1,7 +1,8 @@
 package unifiexporter
 
 import (
-	"log"
+	"fmt"
+	"sync"
 	"time"
 
 	"github.com/mdlayher/unifi"
@@ -37,6 +38,11 @@ type DeviceCollector struct {
 
 	c     *unifi.Client
 	sites []*unifi.Site
+
+	errC chan error
+
+	haltMu sync.RWMutex
+	halt   bool
 }
 
 // Verify that the Exporter implements the prometheus.Collector interface.
@@ -44,6 +50,13 @@ var _ prometheus.Collector = &DeviceCollector{}
 
 // NewDeviceCollector creates a new DeviceCollector which collects metrics for
 // a specified site.
+//
+// Once the DeviceCollector is created, call its ErrC method to retrieve a
+// channel of incoming errors encountered during metrics collection.  This channel
+// must be drained for metrics collection to proceed.
+//
+// When the DeviceCollector is no longer needed, call its Close method to clean
+// up its resources.
 func NewDeviceCollector(c *unifi.Client, sites []*unifi.Site) *DeviceCollector {
 	const (
 		subsystem = "devices"
@@ -56,6 +69,8 @@ func NewDeviceCollector(c *unifi.Client, sites []*unifi.Site) *DeviceCollector {
 	)
 
 	return &DeviceCollector{
+		errC: make(chan error),
+
 		TotalDevices: prometheus.NewGaugeVec(
 			prometheus.GaugeOpts{
 				Namespace: namespace,
@@ -231,6 +246,23 @@ func NewDeviceCollector(c *unifi.Client, sites []*unifi.Site) *DeviceCollector {
 	}
 }
 
+// ErrC returns a channel of incoming errors encountered during metrics
+// collection.  This channel must be drained for metrics collection
+// to proceed.
+func (c *DeviceCollector) ErrC() <-chan error {
+	return c.errC
+}
+
+// Close halts all metric collection activity and cleans up the
+// DeviceCollector's resources when it is no longer needed.
+func (c *DeviceCollector) Close() {
+	c.haltMu.Lock()
+	defer c.haltMu.Unlock()
+
+	c.halt = true
+	close(c.errC)
+}
+
 // collectors contains a list of collectors which are collected each time
 // the exporter is scraped.  This list must be kept in sync with the collectors
 // in DeviceCollector.
@@ -368,6 +400,13 @@ func (c *DeviceCollector) collectDeviceStations(siteLabel string, devices []*uni
 // Describe sends the descriptors of each metric over to the provided channel.
 // The corresponding metric values are sent separately.
 func (c *DeviceCollector) Describe(ch chan<- *prometheus.Desc) {
+	c.haltMu.Lock()
+	defer c.haltMu.Unlock()
+
+	if c.halt {
+		return
+	}
+
 	for _, m := range c.collectors() {
 		m.Describe(ch)
 	}
@@ -376,8 +415,15 @@ func (c *DeviceCollector) Describe(ch chan<- *prometheus.Desc) {
 // Collect sends the metric values for each metric pertaining to the global
 // cluster usage over to the provided prometheus Metric channel.
 func (c *DeviceCollector) Collect(ch chan<- prometheus.Metric) {
+	c.haltMu.Lock()
+	defer c.haltMu.Unlock()
+
+	if c.halt {
+		return
+	}
+
 	if err := c.collect(); err != nil {
-		log.Fatalf("[ERROR] failed collecting device metrics: %v", err)
+		c.errC <- fmt.Errorf("error collecting device metrics: %v", err)
 		return
 	}
 

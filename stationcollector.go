@@ -1,7 +1,8 @@
 package unifiexporter
 
 import (
-	"log"
+	"fmt"
+	"sync"
 
 	"github.com/mdlayher/unifi"
 	"github.com/prometheus/client_golang/prometheus"
@@ -20,6 +21,11 @@ type StationCollector struct {
 
 	c     *unifi.Client
 	sites []*unifi.Site
+
+	errC chan error
+
+	haltMu sync.RWMutex
+	halt   bool
 }
 
 // Verify that the Exporter implements the prometheus.Collector interface.
@@ -27,6 +33,13 @@ var _ prometheus.Collector = &StationCollector{}
 
 // NewStationCollector creates a new StationCollector which collects metrics for
 // a specified site.
+//
+// Once the StationCollector is created, call its ErrC method to retrieve a
+// channel of incoming errors encountered during metrics collection.  This channel
+// must be drained for metrics collection to proceed.
+//
+// When the StationCollector is no longer needed, call its Close method to clean
+// up its resources.
 func NewStationCollector(c *unifi.Client, sites []*unifi.Site) *StationCollector {
 	const (
 		subsystem = "stations"
@@ -38,6 +51,8 @@ func NewStationCollector(c *unifi.Client, sites []*unifi.Site) *StationCollector
 	)
 
 	return &StationCollector{
+		errC: make(chan error),
+
 		TotalStations: prometheus.NewGaugeVec(
 			prometheus.GaugeOpts{
 				Namespace: namespace,
@@ -91,6 +106,23 @@ func NewStationCollector(c *unifi.Client, sites []*unifi.Site) *StationCollector
 		c:     c,
 		sites: sites,
 	}
+}
+
+// ErrC returns a channel of incoming errors encountered during metrics
+// collection.  This channel must be drained for metrics collection
+// to proceed.
+func (c *StationCollector) ErrC() <-chan error {
+	return c.errC
+}
+
+// Close halts all metric collection activity and cleans up the
+// StationCollector's resources when it is no longer needed.
+func (c *StationCollector) Close() {
+	c.haltMu.Lock()
+	defer c.haltMu.Unlock()
+
+	c.halt = true
+	close(c.errC)
 }
 
 // collectors contains a list of collectors which are collected each time
@@ -148,6 +180,13 @@ func (c *StationCollector) collectStationBytes(siteLabel string, stations []*uni
 // Describe sends the descriptors of each metric over to the provided channel.
 // The corresponding metric values are sent separately.
 func (c *StationCollector) Describe(ch chan<- *prometheus.Desc) {
+	c.haltMu.RLock()
+	defer c.haltMu.RUnlock()
+
+	if c.halt {
+		return
+	}
+
 	for _, m := range c.collectors() {
 		m.Describe(ch)
 	}
@@ -156,8 +195,15 @@ func (c *StationCollector) Describe(ch chan<- *prometheus.Desc) {
 // Collect sends the metric values for each metric pertaining to the global
 // cluster usage over to the provided prometheus Metric channel.
 func (c *StationCollector) Collect(ch chan<- prometheus.Metric) {
+	c.haltMu.RLock()
+	defer c.haltMu.RUnlock()
+
+	if c.halt {
+		return
+	}
+
 	if err := c.collect(); err != nil {
-		log.Fatalf("[ERROR] failed collecting station metrics: %v", err)
+		c.errC <- fmt.Errorf("error collecting station metrics: %v", err)
 		return
 	}
 
